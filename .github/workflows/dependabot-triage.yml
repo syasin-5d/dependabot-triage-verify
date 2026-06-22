@@ -1,0 +1,96 @@
+name: Dependabot PR Triage
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          # alert-lookup は GITHUB_TOKEN では機能しない（Dependabot alerts API へのアクセスに
+          # repo/public_repo スコープが必要なため）。基本メタデータ（dependency-names,
+          # package-ecosystem, previous-version 等）は GITHUB_TOKEN でも取得可能。
+          alert-lookup: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Triage PR based on severity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+          PKG_ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          IS_CRITICAL=0
+          DETECTED_BY=""
+
+          echo "DEP_NAMES=${DEP_NAMES} PKG_ECOSYSTEM=${PKG_ECOSYSTEM}"
+
+          # fetch-metadata の package-ecosystem 出力を Advisory Database API 用に変換
+          # https://docs.github.com/ja/rest/security-advisories/global-advisories#list-global-security-advisories
+          case "${PKG_ECOSYSTEM}" in
+            npm_and_yarn) ECOSYSTEM="npm" ;;
+            pip)          ECOSYSTEM="pip" ;;
+            maven)        ECOSYSTEM="maven" ;;
+            gradle)       ECOSYSTEM="gradle" ;;
+            bundler)      ECOSYSTEM="rubygems" ;;
+            composer)     ECOSYSTEM="composer" ;;
+            go_modules)   ECOSYSTEM="go" ;;
+            cargo)        ECOSYSTEM="rust" ;;
+            nuget)        ECOSYSTEM="nuget" ;;
+            *)            ECOSYSTEM="${PKG_ECOSYSTEM}" ;;
+          esac
+
+          # GitHub Advisory Database API（パブリックAPI・認証不要）で
+          # パッケージ単位の critical アドバイザリを検索
+          while IFS= read -r pkg; do
+            pkg=$(echo "$pkg" | sed 's/^ *//;s/ *$//')
+            [ -z "$pkg" ] && continue
+
+            echo "Checking Advisory Database for ${pkg} (${ECOSYSTEM})..."
+            advisory=$(curl -s "https://api.github.com/advisories?package_name=${pkg}&ecosystem=${ECOSYSTEM}&severity=critical&per_page=1")
+            sev=$(echo "$advisory" | jq -r '.[0].severity // empty' 2>/dev/null) || sev=""
+            ghsa=$(echo "$advisory" | jq -r '.[0].ghsa_id // empty' 2>/dev/null) || ghsa=""
+            cvss=$(echo "$advisory" | jq -r '.[0].cvss.score // empty' 2>/dev/null) || cvss=""
+            pkg_name=$(echo "$advisory" | jq -r '.[0].vulnerabilities[0].package.name // empty' 2>/dev/null) || pkg_name=""
+
+            echo "  severity='${sev}' ghsa='${ghsa}' cvss='${cvss}' pkg_name='${pkg_name}'"
+
+            # Advisory Database API の package_name フィルタが不完全な場合があるため、
+            # レスポンス内の package.name が要求したパッケージ名と一致するか確認する
+            if [ "${pkg_name}" != "${pkg}" ]; then
+              echo "  Package name mismatch: expected ${pkg}, got ${pkg_name}. Skipping."
+              sev=""
+            fi
+
+            if [ "${sev}" = "critical" ]; then
+              IS_CRITICAL=1
+              DETECTED_BY="Advisory Database: ${pkg} has critical advisory (${ghsa}, CVSS ${cvss})"
+              echo "Critical advisory found for ${pkg}"
+              break
+            fi
+          done < <(echo "$DEP_NAMES" | tr ',' '\n')
+
+          echo "IS_CRITICAL=${IS_CRITICAL} DETECTED_BY=${DETECTED_BY}"
+
+          if [ "$IS_CRITICAL" -eq 1 ]; then
+            echo "Critical. Keeping open."
+            BODY=$(printf '## Critical セキュリティ脆弱性\n\n**このPRは重要なセキュリティ修正を含むため、オープンのままにしています。**\n\n- 対象パッケージ: `%s`\n- 検出方法: %s\n\n速やかなレビューとマージを推奨します。' "$DEP_NAMES" "$DETECTED_BY")
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
+          else
+            echo "Non-critical. Closing."
+            BODY=$(printf '## Dependabot PR 自動クローズ\n\nこのPRは自動的にクローズされました。\n\n**理由**: Advisory Database において、対象パッケージに Critical 深刻度のセキュリティアドバイザリは見つかりませんでした。\n- 対象パッケージ: `%s`\n- 更新タイプ: `%s`\n\nCritical 深刻度の脆弱性修正のみ手動レビューが必要です。' "$DEP_NAMES" "$UPDATE_TYPE")
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
+            gh pr close "$PR_NUMBER" --repo "$REPO"
+          fi
