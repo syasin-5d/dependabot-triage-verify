@@ -2,7 +2,7 @@
   "name": "dependabot-triage-verify",
   "version": "1.0.0",
   "dependencies": {
-    "handlebars": "4.7.6",
+    "handlebars": "4.7.9",
     "fast-xml-parser": "4.4.0"
   }
 }
