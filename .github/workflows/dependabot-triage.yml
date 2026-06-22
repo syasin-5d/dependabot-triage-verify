@@ -59,16 +59,17 @@ jobs:
             [ -z "$pkg" ] && continue
 
             echo "Checking Advisory Database for ${pkg} (${ECOSYSTEM})..."
-            advisory=$(curl -s "https://api.github.com/advisories?package_name=${pkg}&ecosystem=${ECOSYSTEM}&severity=critical&per_page=1")
-            sev=$(echo "$advisory" | jq -r '.[0].severity // empty' 2>/dev/null) || sev=""
-            ghsa=$(echo "$advisory" | jq -r '.[0].ghsa_id // empty' 2>/dev/null) || ghsa=""
-            cvss=$(echo "$advisory" | jq -r '.[0].cvss.score // empty' 2>/dev/null) || cvss=""
-            pkg_name=$(echo "$advisory" | jq -r '.[0].vulnerabilities[0].package.name // empty' 2>/dev/null) || pkg_name=""
+            # severity=critical フィルタは API 側で不安定なため、フィルタなしでクエリし
+            # クライアント側で severity=critical かつ package.name が一致するものを検索する
+            advisory=$(curl -s "https://api.github.com/advisories?package_name=${pkg}&ecosystem=${ECOSYSTEM}&per_page=5")
+            sev=$(echo "$advisory" | jq -r "[.[] | select(.severity == \"critical\" and .vulnerabilities[0].package.name == \"${pkg}\")] | .[0].severity // empty" 2>/dev/null) || sev=""
+            ghsa=$(echo "$advisory" | jq -r "[.[] | select(.severity == \"critical\" and .vulnerabilities[0].package.name == \"${pkg}\")] | .[0].ghsa_id // empty" 2>/dev/null) || ghsa=""
+            cvss=$(echo "$advisory" | jq -r "[.[] | select(.severity == \"critical\" and .vulnerabilities[0].package.name == \"${pkg}\")] | .[0].cvss.score // empty" 2>/dev/null) || cvss=""
+            pkg_name=$(echo "$advisory" | jq -r "[.[] | select(.severity == \"critical\" and .vulnerabilities[0].package.name == \"${pkg}\")] | .[0].vulnerabilities[0].package.name // empty" 2>/dev/null) || pkg_name=""
 
             echo "  severity='${sev}' ghsa='${ghsa}' cvss='${cvss}' pkg_name='${pkg_name}'"
 
-            # Advisory Database API の package_name フィルタが不完全な場合があるため、
-            # レスポンス内の package.name が要求したパッケージ名と一致するか確認する
+            # 念のため package.name の一致も確認
             if [ "${pkg_name}" != "${pkg}" ]; then
               echo "  Package name mismatch: expected ${pkg}, got ${pkg_name}. Skipping."
               sev=""
